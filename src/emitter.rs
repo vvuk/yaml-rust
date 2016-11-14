@@ -4,8 +4,9 @@ use yaml::*;
 
 #[derive(Copy, Clone, Debug)]
 pub enum EmitError {
-        FmtError(fmt::Error),
-        BadHashmapKey,
+    FmtError(fmt::Error),
+    BadHashmapKey,
+    BadSimpleNode,
 }
 
 impl From<fmt::Error> for EmitError {
@@ -86,6 +87,43 @@ fn escape_str(wr: &mut fmt::Write, v: &str) -> Result<(), fmt::Error> {
     Ok(())
 }
 
+// Decide whether we can write this value in a compact way.
+// Looks for arrays of values of all the same type.
+fn should_compact_value(node: &Yaml) -> bool {
+    match *node {
+        Yaml::Array(ref nodes) => {
+            if nodes.is_empty() {
+                return true;
+            }
+
+            //println!("should_compact: 0: {:?}", nodes[0]);
+            match nodes[0] {
+                Yaml::Integer(_) | Yaml::Real(_) => {
+                    for n in nodes.iter() {
+                        match *n {
+                            Yaml::Integer(_) | Yaml::Real(_) => (),
+                            _ => { return false; },
+                        }
+                    }
+                },
+                Yaml::Boolean(_) => {
+                    for n in nodes.iter() {
+                        match *n {
+                            Yaml::Boolean(_) => (),
+                            _ => { return false; },
+                        }
+                    }
+                },
+                _ => { return false; },
+            }
+        },
+        _ => { return false; },
+    };
+
+
+    return true;
+}
+
 impl<'a> YamlEmitter<'a> {
     pub fn new(writer: &'a mut fmt::Write) -> YamlEmitter {
         YamlEmitter {
@@ -104,7 +142,6 @@ impl<'a> YamlEmitter<'a> {
     }
 
     fn write_indent(&mut self) -> EmitResult {
-        if self.level <= 0 { return Ok(()); }
         for _ in 0..self.level {
             for _ in 0..self.best_indent {
                 try!(write!(self.writer, " "));
@@ -116,42 +153,46 @@ impl<'a> YamlEmitter<'a> {
     fn emit_node_compact(&mut self, node: &Yaml) -> EmitResult {
         match *node {
             Yaml::Array(ref v) => {
-                    try!(write!(self.writer, "["));
-                    if self.level >= 0 {
-                        try!(write!(self.writer, "+ "));
-                    }
-                    self.level += 1;
-                    for (cnt, x) in v.iter().enumerate() {
-                        try!(self.write_indent());
-                        if cnt > 0 { try!(write!(self.writer, ", ")); }
-                        try!(self.emit_node(x));
-                    }
-                    self.level -= 1;
-                    try!(write!(self.writer, "]"));
-                    Ok(())
+                try!(write!(self.writer, "["));
+                self.level += 1;
+                for (cnt, x) in v.iter().enumerate() {
+                    if cnt > 0 { try!(write!(self.writer, ", ")); }
+                    // if we're emitting a compact node, the node's sub-values
+                    // must be simple
+                    try!(self.emit_simple_node(x));
+                }
+                self.level -= 1;
+                try!(write!(self.writer, "]"));
+                Ok(())
             },
             Yaml::Hash(ref h) => {
-                    try!(self.writer.write_str("{"));
-                    self.level += 1;
-                    for (cnt, (k, v)) in h.iter().enumerate() {
-                        if cnt > 0 {
-                            try!(write!(self.writer, ", "));
-                        }
-                        match *k {
-                            // complex key is not supported
-                            Yaml::Array(_) | Yaml::Hash(_) => {
-                                return Err(EmitError::BadHashmapKey);
-                            },
-                            _ => { try!(self.emit_node(k)); }
-                        }
-                        try!(write!(self.writer, ": "));
-                        try!(self.emit_node(v));
+                try!(self.writer.write_str("{"));
+                self.level += 1;
+                for (cnt, (k, v)) in h.iter().enumerate() {
+                    if cnt > 0 {
+                        try!(write!(self.writer, ", "));
                     }
-                    try!(self.writer.write_str("}"));
-                    self.level -= 1;
-                    Ok(())
+                    // complex hash key is not supported
+                    try!(self.emit_simple_node(k).map_err(|_| EmitError::BadHashmapKey));
+                    try!(write!(self.writer, ": "));
+                    // XXX we should be using emit_simple_node here, and should be
+                    // checking if we can emit a hash in a simple way
+                    try!(self.emit_node(v));
+                }
+                try!(self.writer.write_str("}"));
+                self.level -= 1;
+                Ok(())
             },
             _ => self.emit_node(node)
+        }
+    }
+
+    // This can only emit non-array/hash nodes; if one is passed in,
+    // an error results.
+    fn emit_simple_node(&mut self, node: &Yaml) -> EmitResult {
+        match *node {
+            Yaml::Array(_) | Yaml::Hash(_) => Err(EmitError::BadSimpleNode),
+            _ => self.emit_node(node),
         }
     }
 
@@ -200,7 +241,11 @@ impl<'a> YamlEmitter<'a> {
                             _ => { try!(self.emit_node(k)); }
                         }
                         try!(write!(self.writer, ": "));
-                        try!(self.emit_node(v));
+                        if should_compact_value(v) {
+                            try!(self.emit_node_compact(v));
+                        } else {
+                            try!(self.emit_node(v));
+                        }
                     }
                     self.level -= 1;
                     Ok(())
